@@ -1,0 +1,15 @@
+# PlatformIO
+.pio/
+
+# Editor
+.vscode/
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated ebook output
+/data/book.txt
