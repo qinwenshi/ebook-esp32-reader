@@ -5,16 +5,18 @@ try:
     PROJECT_DIR = Path(env["PROJECT_DIR"])
 except Exception:
     PROJECT_DIR = Path(__file__).resolve().parents[1]
+
 DATA_DIR = PROJECT_DIR / "data"
-OUTPUT_FILE = DATA_DIR / "book.txt"
+MANIFEST_FILE = DATA_DIR / "books.txt"
+MAX_BOOKS = 2
 
 
-def pick_source_file() -> Path:
+def pick_source_files():
     candidates = [p for p in PROJECT_DIR.glob("*.txt") if not p.name.startswith("~$")]
     if not candidates:
         raise RuntimeError("No .txt files found in project root.")
-    candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
-    return candidates[0]
+    candidates.sort(key=lambda p: p.name.lower())
+    return candidates[:MAX_BOOKS]
 
 
 def needs_update(src: Path, dst: Path) -> bool:
@@ -33,7 +35,22 @@ def convert_gb18030_to_utf8(src: Path, dst: Path) -> None:
             fout.write(chunk)
 
 
-source = pick_source_file()
-if needs_update(source, OUTPUT_FILE):
-    print(f"[ebook] Converting {source.name} -> data/book.txt")
-    convert_gb18030_to_utf8(source, OUTPUT_FILE)
+def write_manifest(entries) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with MANIFEST_FILE.open("w", encoding="utf-8", newline="\n") as fout:
+        for dst_name, title in entries:
+            fout.write(f"{dst_name}|{title}\n")
+
+
+sources = pick_source_files()
+manifest_entries = []
+for i, source in enumerate(sources):
+    dst_name = f"book{i + 1}.txt"
+    output = DATA_DIR / dst_name
+    title = source.stem
+    if needs_update(source, output):
+        print(f"[ebook] Converting {source.name} -> data/{dst_name}")
+        convert_gb18030_to_utf8(source, output)
+    manifest_entries.append((dst_name, title))
+
+write_manifest(manifest_entries)

@@ -12,4 +12,5 @@ __pycache__/
 *.pyc
 
 # Generated ebook output
-/data/book.txt
+/data/book*.txt
+/data/books.txt

@@ -13,6 +13,7 @@ static constexpr int EPD_CS2 = 13; // Not used.
 // Button pins. Avoid IO9 (BOOT).
 static constexpr int BTN_PREV = 1;
 static constexpr int BTN_NEXT = 20;
+static constexpr int BTN_MENU = 21;
 
 #ifdef LED_BUILTIN
 static constexpr int LED_PIN = LED_BUILTIN;
