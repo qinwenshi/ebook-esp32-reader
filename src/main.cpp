@@ -41,6 +41,11 @@ static constexpr int CONTENT_H = SCREEN_H - CONTENT_Y - MARGIN_Y;
 
 static constexpr char BOOKS_MANIFEST[] = "/books.txt";
 static constexpr uint8_t MAX_BOOKS = 2;
+static constexpr uint8_t MAX_CHARS_PER_LINE = 24;
+static constexpr size_t MAX_LINE_BYTES = MAX_CHARS_PER_LINE * 4 + 4;
+static constexpr uint32_t INDEX_MAGIC = 0x31445849; // "IDX1"
+static constexpr uint16_t INDEX_VERSION = 1;
+static constexpr uint8_t MAX_PARTIAL_REFRESHES = 6;
 
 static constexpr uint32_t DEBOUNCE_MS = 30;
 
@@ -64,10 +69,17 @@ ButtonState buttons[] = {
     {BTN_MENU, false, false, 0},
 };
 
-struct RenderResult {
-  uint32_t nextOffset;
-  bool eof;
+struct IndexHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t linesPerPage;
+  uint16_t charsPerLine;
+  uint16_t reserved;
+  uint32_t bookSize;
+  uint32_t pageCount;
 };
+
+static_assert(sizeof(IndexHeader) == 20, "IndexHeader size mismatch");
 
 struct BookInfo {
   String path;
@@ -94,6 +106,7 @@ static uint32_t currentBookSize = 0;
 static int16_t lineHeight = 0;
 static int16_t contentTop = 0;
 static int16_t linesPerPage = 0;
+static uint8_t partialRefreshes = 0;
 
 void setLed(bool on) {
   if (LED_PIN < 0) {
@@ -126,27 +139,6 @@ uint8_t utf8CharLen(uint8_t lead) {
     return 4;
   }
   return 1;
-}
-
-bool readUtf8Char(File &file, char *out, size_t &outLen) {
-  int first = file.read();
-  if (first < 0) {
-    return false;
-  }
-  uint8_t lead = static_cast<uint8_t>(first);
-  size_t len = utf8CharLen(lead);
-  out[0] = static_cast<char>(lead);
-  outLen = 1;
-  for (size_t i = 1; i < len; ++i) {
-    int next = file.read();
-    if (next < 0) {
-      break;
-    }
-    out[i] = static_cast<char>(next);
-    outLen++;
-  }
-  out[outLen] = '\0';
-  return true;
 }
 
 String truncateUtf8(const String &text, size_t maxChars) {
@@ -245,6 +237,133 @@ void saveProgress(size_t index, uint32_t offset) {
   prefs.putUChar("last", static_cast<uint8_t>(index));
 }
 
+String indexPathFor(const String &bookPath) {
+  int dot = bookPath.lastIndexOf('.');
+  if (dot > 0) {
+    return bookPath.substring(0, dot) + ".idx";
+  }
+  return bookPath + ".idx";
+}
+
+bool loadIndexFile(size_t index) {
+  if (index >= bookCount) {
+    return false;
+  }
+  String idxPath = indexPathFor(books[index].path);
+  File idx = LittleFS.open(idxPath, "r");
+  if (!idx) {
+    return false;
+  }
+  IndexHeader header = {};
+  if (idx.read(reinterpret_cast<uint8_t *>(&header), sizeof(header)) != sizeof(header)) {
+    idx.close();
+    return false;
+  }
+  if (header.magic != INDEX_MAGIC || header.version != INDEX_VERSION ||
+      header.linesPerPage != static_cast<uint16_t>(linesPerPage) ||
+      header.charsPerLine != MAX_CHARS_PER_LINE ||
+      header.bookSize != books[index].size || header.pageCount == 0) {
+    idx.close();
+    return false;
+  }
+  pageOffsets.clear();
+  pageOffsets.reserve(header.pageCount);
+  for (uint32_t i = 0; i < header.pageCount; ++i) {
+    uint32_t offset = 0;
+    if (idx.read(reinterpret_cast<uint8_t *>(&offset), sizeof(offset)) != sizeof(offset)) {
+      break;
+    }
+    pageOffsets.push_back(offset);
+  }
+  idx.close();
+  return pageOffsets.size() == header.pageCount;
+}
+
+bool buildIndexFile(size_t index) {
+  if (index >= bookCount) {
+    return false;
+  }
+  File book = LittleFS.open(books[index].path, "r");
+  if (!book) {
+    return false;
+  }
+  String idxPath = indexPathFor(books[index].path);
+  File idx = LittleFS.open(idxPath, "w");
+  if (!idx) {
+    book.close();
+    return false;
+  }
+  IndexHeader header = {};
+  header.magic = INDEX_MAGIC;
+  header.version = INDEX_VERSION;
+  header.linesPerPage = static_cast<uint16_t>(linesPerPage);
+  header.charsPerLine = MAX_CHARS_PER_LINE;
+  header.bookSize = books[index].size;
+  header.pageCount = 0;
+  idx.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+
+  pageOffsets.clear();
+  pageOffsets.push_back(0);
+  uint32_t offset = 0;
+  uint16_t lineCount = 0;
+  uint8_t buffer[512];
+  while (book.available()) {
+    size_t readBytes = book.read(buffer, sizeof(buffer));
+    if (readBytes == 0) {
+      break;
+    }
+    for (size_t i = 0; i < readBytes; ++i) {
+      offset++;
+      if (buffer[i] == '\n') {
+        lineCount++;
+        if (lineCount >= linesPerPage) {
+          pageOffsets.push_back(offset);
+          lineCount = 0;
+        }
+      }
+    }
+  }
+  if (pageOffsets.size() > 1 && pageOffsets.back() >= books[index].size) {
+    pageOffsets.pop_back();
+  }
+
+  header.pageCount = pageOffsets.size();
+  idx.seek(0, SeekSet);
+  idx.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+  idx.seek(sizeof(header), SeekSet);
+  for (size_t i = 0; i < pageOffsets.size(); ++i) {
+    uint32_t pageOffset = pageOffsets[i];
+    idx.write(reinterpret_cast<const uint8_t *>(&pageOffset), sizeof(pageOffset));
+  }
+  idx.close();
+  book.close();
+  return pageOffsets.size() > 0;
+}
+
+bool ensureIndex(size_t index) {
+  if (loadIndexFile(index)) {
+    return true;
+  }
+  return buildIndexFile(index);
+}
+
+size_t findPageForOffset(uint32_t offset) {
+  if (pageOffsets.empty()) {
+    return 0;
+  }
+  size_t low = 0;
+  size_t high = pageOffsets.size() - 1;
+  while (low < high) {
+    size_t mid = (low + high + 1) / 2;
+    if (pageOffsets[mid] <= offset) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return low;
+}
+
 PageAction pollButtons() {
   uint32_t now = millis();
   for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
@@ -300,87 +419,42 @@ void drawHeader(const String &title) {
   }
 }
 
-void drawHeaderPartial(const String &title) {
-  display.setPartialWindow(0, 0, SCREEN_W, HEADER_H);
-  display.firstPage();
-  do {
-    drawHeader(title);
-  } while (display.nextPage());
-}
-
-RenderResult renderPage(const char *path, uint32_t startOffset, bool draw) {
-  u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+void renderPage(const char *path, uint32_t startOffset) {
+  u8g2Fonts.setFont(u8g2_font_unifont_t_chinese2);
   File file = LittleFS.open(path, "r");
   if (!file) {
-    return {startOffset, true};
+    return;
   }
 
   if (!file.seek(startOffset, SeekSet)) {
     file.close();
-    return {startOffset, true};
+    return;
   }
 
   int16_t y = contentTop + lineHeight;
-  int lines = 0;
-  uint32_t offset = startOffset;
-  String line;
-  line.reserve(256);
-
-  while (lines < linesPerPage) {
-    line = "";
-    bool hadChar = false;
-
-    while (true) {
-      char ch[5] = {0};
-      size_t chLen = 0;
-      if (!readUtf8Char(file, ch, chLen)) {
-        break;
-      }
-      offset = file.position();
-      if (ch[0] == '\n') {
-        break;
-      }
-      if (ch[0] == '\r') {
-        continue;
-      }
-      hadChar = true;
-      line += ch;
-      if (u8g2Fonts.getUTF8Width(line.c_str()) > CONTENT_W) {
-        if (line.length() > chLen) {
-          line.remove(line.length() - chLen);
-          file.seek(static_cast<int32_t>(file.position()) - static_cast<int32_t>(chLen), SeekSet);
-          offset = file.position();
-        }
-        break;
-      }
+  for (int lines = 0; lines < linesPerPage; ++lines) {
+    char lineBuf[MAX_LINE_BYTES] = {0};
+    size_t readLen = file.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+    bool atEof = !file.available();
+    if (readLen > 0 && lineBuf[readLen - 1] == '\r') {
+      readLen--;
     }
-
-    if (!hadChar && line.length() == 0 && offset >= currentBookSize) {
-      break;
-    }
-
-    if (draw) {
-      u8g2Fonts.setCursor(MARGIN_X, y);
-      u8g2Fonts.print(line);
-    }
-
+    lineBuf[readLen] = '\0';
+    u8g2Fonts.setCursor(MARGIN_X, y);
+    u8g2Fonts.print(lineBuf);
     y += lineHeight;
-    lines++;
-
-    if (offset >= currentBookSize) {
+    if (readLen == 0 && atEof) {
       break;
     }
   }
-
   file.close();
-  return {offset, offset >= currentBookSize};
 }
 
 void drawContent(size_t pageIndex) {
   u8g2Fonts.setForegroundColor(GxEPD_BLACK);
   u8g2Fonts.setBackgroundColor(GxEPD_WHITE);
-  u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
-  renderPage(books[currentBook].path.c_str(), pageOffsets[pageIndex], true);
+  u8g2Fonts.setFont(u8g2_font_unifont_t_chinese2);
+  renderPage(books[currentBook].path.c_str(), pageOffsets[pageIndex]);
 }
 
 void drawPageFull(size_t pageIndex) {
@@ -392,6 +466,7 @@ void drawPageFull(size_t pageIndex) {
     display.fillRect(0, CONTENT_AREA_Y, SCREEN_W, CONTENT_AREA_H, GxEPD_WHITE);
     drawContent(pageIndex);
   } while (display.nextPage());
+  partialRefreshes = 0;
 }
 
 void drawPagePartial(size_t pageIndex) {
@@ -401,15 +476,16 @@ void drawPagePartial(size_t pageIndex) {
     display.fillRect(0, CONTENT_AREA_Y, SCREEN_W, CONTENT_AREA_H, GxEPD_WHITE);
     drawContent(pageIndex);
   } while (display.nextPage());
+  partialRefreshes++;
 }
 
 void drawBookListContent() {
   u8g2Fonts.setForegroundColor(GxEPD_BLACK);
   u8g2Fonts.setBackgroundColor(GxEPD_WHITE);
-  u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2Fonts.setFont(u8g2_font_unifont_t_chinese2);
   int16_t y = contentTop + lineHeight;
   for (size_t i = 0; i < bookCount; ++i) {
-    String title = truncateUtf8(books[i].title, 16);
+    String title = truncateUtf8(books[i].title, MAX_CHARS_PER_LINE - 6);
     u8g2Fonts.setCursor(MARGIN_X, y);
     u8g2Fonts.print((i == selectedBook) ? "> " : "  ");
     u8g2Fonts.print(i + 1);
@@ -429,31 +505,35 @@ void drawBookListPartial() {
     display.fillRect(0, CONTENT_AREA_Y, SCREEN_W, CONTENT_AREA_H, GxEPD_WHITE);
     drawBookListContent();
   } while (display.nextPage());
+  partialRefreshes++;
 }
 
-void buildOffsetsTo(uint32_t targetOffset) {
-  pageOffsets.clear();
-  pageOffsets.push_back(0);
-  currentPage = 0;
-  if (targetOffset == 0 || currentBookSize == 0) {
+void drawBookListFull() {
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    drawHeader("LIBRARY");
+    display.fillRect(0, CONTENT_AREA_Y, SCREEN_W, CONTENT_AREA_H, GxEPD_WHITE);
+    drawBookListContent();
+  } while (display.nextPage());
+  partialRefreshes = 0;
+}
+
+void refreshReadingPage(bool forceFull) {
+  if (forceFull || partialRefreshes >= MAX_PARTIAL_REFRESHES) {
+    drawPageFull(currentPage);
     return;
   }
-  while (pageOffsets.back() < targetOffset) {
-    RenderResult result = renderPage(books[currentBook].path.c_str(), pageOffsets.back(), false);
-    if (result.nextOffset <= pageOffsets.back()) {
-      break;
-    }
-    pageOffsets.push_back(result.nextOffset);
-    if (result.nextOffset >= targetOffset) {
-      break;
-    }
-    delay(0);
+  drawPagePartial(currentPage);
+}
+
+void refreshBookList(bool forceFull) {
+  if (forceFull || partialRefreshes >= MAX_PARTIAL_REFRESHES) {
+    drawBookListFull();
+    return;
   }
-  if (pageOffsets.size() > 1 && pageOffsets.back() > targetOffset) {
-    currentPage = pageOffsets.size() - 2;
-  } else {
-    currentPage = pageOffsets.size() - 1;
-  }
+  drawBookListPartial();
 }
 
 void openBook(size_t index) {
@@ -466,16 +546,19 @@ void openBook(size_t index) {
     drawError("Empty book");
     return;
   }
-  buildOffsetsTo(books[index].savedOffset);
+  if (!ensureIndex(index)) {
+    drawError("Index build failed");
+    return;
+  }
+  currentPage = findPageForOffset(books[index].savedOffset);
   uiMode = UiMode::Reading;
-  drawPageFull(currentPage);
+  refreshReadingPage(true);
   saveProgress(currentBook, pageOffsets[currentPage]);
 }
 
 void enterListMode() {
   uiMode = UiMode::List;
-  drawHeaderPartial("LIBRARY");
-  drawBookListPartial();
+  refreshBookList(true);
 }
 
 void setup() {
@@ -496,7 +579,7 @@ void setup() {
   u8g2Fonts.begin(display);
   u8g2Fonts.setFontMode(1);
 
-  u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+  u8g2Fonts.setFont(u8g2_font_unifont_t_chinese2);
   int16_t ascent = u8g2Fonts.getFontAscent();
   int16_t descent = u8g2Fonts.getFontDescent();
   lineHeight = ascent - descent + LINE_GAP;
@@ -546,10 +629,10 @@ void loop() {
   if (uiMode == UiMode::List) {
     if (action == PageAction::Prev && selectedBook > 0) {
       selectedBook--;
-      drawBookListPartial();
+      refreshBookList(false);
     } else if (action == PageAction::Next && selectedBook + 1 < bookCount) {
       selectedBook++;
-      drawBookListPartial();
+      refreshBookList(false);
     } else if (action == PageAction::Menu) {
       openBook(selectedBook);
     }
@@ -574,18 +657,11 @@ void loop() {
     if (currentPage + 1 < pageOffsets.size()) {
       currentPage++;
       pageChanged = true;
-    } else {
-      RenderResult result = renderPage(books[currentBook].path.c_str(), pageOffsets[currentPage], false);
-      if (result.nextOffset < currentBookSize && result.nextOffset > pageOffsets[currentPage]) {
-        pageOffsets.push_back(result.nextOffset);
-        currentPage++;
-        pageChanged = true;
-      }
     }
   }
 
   if (pageChanged) {
-    drawPagePartial(currentPage);
+    refreshReadingPage(false);
     saveProgress(currentBook, pageOffsets[currentPage]);
   }
 

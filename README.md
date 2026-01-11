@@ -15,8 +15,12 @@ ESP32 + e-paper ebook viewer using PlatformIO.
 
 The `tools/prepare_book.py` script picks up to two `.txt` files in the
 project root (sorted by filename, ignoring `~$` temp files), converts them
-to UTF-8, writes `data/book1.txt`, `data/book2.txt`, and creates
-`data/books.txt` for the on-device list.
+to UTF-8, wraps lines to a fixed width (24 chars), writes `data/book1.txt`,
+`data/book2.txt`, and creates `data/books.txt` for the on-device list.
+The firmware uses a monospaced font to match this wrapping.
+On first open, the device builds a page index cache for each book.
+To reduce ghosting, the firmware performs a full refresh after several
+partial updates.
 
 ## Buttons
 

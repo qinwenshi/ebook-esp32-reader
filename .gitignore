@@ -14,3 +14,4 @@ __pycache__/
 # Generated ebook output
 /data/book*.txt
 /data/books.txt
+/data/*.idx

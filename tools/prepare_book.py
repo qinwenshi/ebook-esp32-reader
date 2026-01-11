@@ -9,6 +9,7 @@ except Exception:
 DATA_DIR = PROJECT_DIR / "data"
 MANIFEST_FILE = DATA_DIR / "books.txt"
 MAX_BOOKS = 2
+MAX_CHARS_PER_LINE = 24  # Keep in sync with firmware.
 
 
 def pick_source_files():
@@ -25,14 +26,33 @@ def needs_update(src: Path, dst: Path) -> bool:
     return src.stat().st_mtime > dst.stat().st_mtime
 
 
+def wrap_text(fin, fout, max_chars: int) -> None:
+    for raw_line in fin:
+        line = raw_line.rstrip("\r\n")
+        if not line:
+            fout.write("\n")
+            continue
+        buf = []
+        count = 0
+        for ch in line:
+            if ch == "\t":
+                ch = " "
+            buf.append(ch)
+            count += 1
+            if count >= max_chars:
+                fout.write("".join(buf))
+                fout.write("\n")
+                buf = []
+                count = 0
+        if buf:
+            fout.write("".join(buf))
+            fout.write("\n")
+
+
 def convert_gb18030_to_utf8(src: Path, dst: Path) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with src.open("r", encoding="gb18030") as fin, dst.open("w", encoding="utf-8", newline="") as fout:
-        while True:
-            chunk = fin.read(4096)
-            if not chunk:
-                break
-            fout.write(chunk)
+    with src.open("r", encoding="gb18030") as fin, dst.open("w", encoding="utf-8", newline="\n") as fout:
+        wrap_text(fin, fout, MAX_CHARS_PER_LINE)
 
 
 def write_manifest(entries) -> None:
